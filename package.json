@@ -1,0 +1,27 @@
+{
+	"name": "fleet-knowledge",
+	"version": "0.1.0",
+	"description": "Generic knowledge plane for agent fleets: SQLite knowledge store, hub sink API, sync + anti-entropy, distillation, MCP recall, consult/oracle API layer",
+	"license": "MIT",
+	"type": "module",
+	"private": true,
+	"engines": {
+		"bun": ">=1.2"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "bun test ./test/",
+		"lint": "bunx @biomejs/biome check src bin test",
+		"lint:fix": "bunx @biomejs/biome check --write src bin test",
+		"serve": "bun bin/knowledge-api.ts",
+		"worker": "bun bin/knowledge-worker.ts",
+		"mcp": "bun bin/knowledge-mcp.ts"
+	},
+	"dependencies": {
+		"p-queue": "^8",
+		"zod": "^4"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.2"
+	}
+}

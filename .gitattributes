@@ -1,0 +1,6 @@
+# Vendored third-party code — GitHub should not count it in language stats.
+decant/** linguist-vendored
+
+# Documentation is documentation, not the implementation language.
+docs/** linguist-documentation
+*.md linguist-documentation

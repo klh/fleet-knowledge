@@ -1,0 +1,704 @@
+import type { Database } from "bun:sqlite";
+import { ACTIVITY_BUCKETS, type ActivityBucket, toolBucket } from "./buckets.ts";
+import { defaultPricing } from "./cost.ts";
+import { type DateFilter, sessionDatePredicate, whereClause } from "./date-filter.ts";
+import { withImmediateTransaction } from "./db.ts";
+import type { TokenUsage } from "./model.ts";
+import { modelUsageForScope, sessionCostParts, totalCost } from "./model-usage.ts";
+import { sessionUserStatePredicateForDatabase } from "./session-user-state.ts";
+import { queryRow, queryRows, runStatement } from "./sqlite-statements.ts";
+import {
+  allocateAgentMessages,
+  allocateGeneration,
+  allocateLatency,
+  type BlockRow,
+  blockActivity,
+  CHARS_PER_TOKEN,
+  emptyBuckets,
+  emptyLatency,
+  finish,
+  firstEditSeqBySession,
+  groupBy,
+  type MutableBucket,
+  type MutableLatency,
+  type PerSessionBuckets,
+  phaseOf,
+  type SessionRow,
+  share,
+  type TokenEconomics,
+} from "./token-allocate.ts";
+
+// Bump when vector semantics change so the next sync rebuilds derived rows.
+export const SESSION_ECONOMICS_FORMAT_VERSION = 11;
+
+export type {
+  Phase,
+  PhaseAmounts,
+  TokenEconomics,
+  TokenEconomicsBucket,
+} from "./token-allocate.ts";
+
+interface ResultRow {
+  session_id: number;
+  tool_name: string | null;
+  input: string | null;
+  bytes: number;
+  call_seq: number | null;
+}
+
+type QueryParam = string | number;
+
+export interface SessionEconomicsVector {
+  id: number;
+  started_at: string | null;
+  input_cost: number;
+  output_cost: number;
+  reported_cost: number;
+  billed_input_tokens: number;
+  waiting_on_user_ms: number;
+  buckets: Record<
+    ActivityBucket,
+    {
+      generation: number;
+      context_window: number;
+      tool_calls: number;
+      touched: boolean;
+      // Pre-first-edit portions; context_window_orientation excludes folded-in
+      // generation, like context_window.
+      generation_orientation: number;
+      context_window_orientation: number;
+      active_ms: number;
+      active_ms_orientation: number;
+    }
+  >;
+}
+
+export function tokenEconomics(db: Database, filter?: DateFilter | null): TokenEconomics {
+  const date = sessionDatePredicate("s", filter);
+  const visible = {
+    sql: [date.sql, sessionUserStatePredicateForDatabase(db, "s")]
+      .filter((clause) => clause !== "")
+      .join(" AND "),
+    params: date.params,
+  };
+  return aggregateEconomicsVectors(
+    vectorsForScopeWithCache(
+      db,
+      `WITH scoped_session AS (
+         SELECT s.id FROM session s ${whereClause(visible)}
+       )`,
+      visible.params,
+    ),
+  );
+}
+
+/** Load persisted per-session activity vectors for the in-memory server cache.
+ * This intentionally never falls back to transcript scans: startup sync
+ * backfills missing rows and then invalidates the cache. */
+export function computeSessionEconomicsVectors(
+  db: Database,
+  options: { cancelled?: () => boolean } = {},
+): SessionEconomicsVector[] {
+  const visibleSession = sessionUserStatePredicateForDatabase(db, "s");
+  return cachedVectorsForScope(
+    db,
+    `WITH scoped_session AS (
+       SELECT s.id
+       FROM session s
+       WHERE ${visibleSession}
+     )`,
+    [],
+    options.cancelled,
+  );
+}
+
+/** Mirrors sessionDatePredicate: string-compare on the YYYY-MM-DD prefix. */
+export function economicsVectorMatchesFilter(
+  vector: SessionEconomicsVector,
+  filter?: DateFilter | null,
+): boolean {
+  const from = filter?.from ?? null;
+  const to = filter?.to ?? null;
+  if (from == null && to == null) {
+    return true;
+  }
+  if (vector.started_at == null) {
+    return false;
+  }
+  const day = vector.started_at.slice(0, 10);
+  return (from == null || day >= from) && (to == null || day <= to);
+}
+
+export function aggregateEconomicsVectors(
+  vectors: Iterable<SessionEconomicsVector>,
+): TokenEconomics {
+  const buckets = emptyBuckets();
+  let inputCost = 0;
+  let outputCost = 0;
+  let reportedCost = 0;
+  let waitingOnUserMs = 0;
+  for (const vector of vectors) {
+    inputCost += vector.input_cost;
+    outputCost += vector.output_cost;
+    reportedCost += vector.reported_cost;
+    waitingOnUserMs += vector.waiting_on_user_ms;
+    // Each session's cost is split by its own activity before summing. Pooling
+    // first would let one expensive session's dollars follow another session's
+    // mix, so an archive total would not equal the sum of its sessions.
+    let generation = 0;
+    let window = 0;
+    let windowOrientation = 0;
+    for (const bucket of ACTIVITY_BUCKETS) {
+      const part = vector.buckets[bucket];
+      generation += part.generation;
+      window += part.context_window + part.generation;
+      windowOrientation += part.context_window_orientation + part.generation_orientation;
+    }
+    for (const bucket of ACTIVITY_BUCKETS) {
+      const entry = buckets.get(bucket);
+      const part = vector.buckets[bucket];
+      if (entry == null || part == null) {
+        continue;
+      }
+      // Generation is part of the window; mirror it into the orientation
+      // portion so the phase cost split uses the same window basis.
+      const partWindow = part.context_window + part.generation;
+      const partWindowOrientation = part.context_window_orientation + part.generation_orientation;
+      entry.generation += part.generation;
+      entry.contextWindow += partWindow;
+      entry.genOrientation += part.generation_orientation;
+      entry.windowOrientation += partWindowOrientation;
+      entry.activeMs += part.active_ms;
+      entry.activeMsOrientation += part.active_ms_orientation;
+      entry.toolCalls += part.tool_calls;
+      // Reported cost has no input/output split; it follows the window share
+      // like input cost so bucket costs still reconcile to the session total.
+      entry.cost +=
+        vector.output_cost * share(part.generation, generation) +
+        (vector.input_cost + vector.reported_cost) * share(partWindow, window);
+      entry.costOrientation +=
+        vector.output_cost * share(part.generation_orientation, generation) +
+        (vector.input_cost + vector.reported_cost) * share(partWindowOrientation, window);
+      if (part.touched) {
+        entry.sessions.add(vector.id);
+      }
+    }
+    // Dollars with no activity weight to follow still belong to the session,
+    // so bucket costs reconcile to its estimate. A session with no recorded
+    // activity never edited a file, so it is orientation.
+    const orientationShare = window > 0 ? windowOrientation / window : 1;
+    if (generation <= 0) {
+      chargeUnattributed(buckets, "communicating", vector.id, vector.output_cost, orientationShare);
+    }
+    if (window <= 0) {
+      chargeUnattributed(
+        buckets,
+        "context",
+        vector.id,
+        vector.input_cost + vector.reported_cost,
+        orientationShare,
+      );
+    }
+  }
+  return finish(buckets, inputCost, outputCost, reportedCost, waitingOnUserMs);
+}
+
+function chargeUnattributed(
+  buckets: Map<ActivityBucket, MutableBucket>,
+  bucket: ActivityBucket,
+  sessionId: number,
+  cost: number,
+  orientationShare: number,
+): void {
+  const entry = buckets.get(bucket);
+  if (entry == null || cost <= 0) {
+    return;
+  }
+  entry.cost += cost;
+  entry.costOrientation += cost * orientationShare;
+  entry.sessions.add(sessionId);
+}
+
+export function tokenEconomicsForSession(db: Database, sessionId: number): TokenEconomics | null {
+  const scopeCte = `WITH RECURSIVE scoped_session(id) AS (
+    SELECT id FROM session WHERE id = ?1
+    UNION ALL
+    SELECT child.id
+    FROM session child
+    JOIN scoped_session parent ON parent.id = child.parent_session_id
+  )`;
+  const expected = scopeCount(db, scopeCte, [sessionId]);
+  if (expected === 0) {
+    return null;
+  }
+  const cached = cachedVectorsForScope(db, scopeCte, [sessionId]);
+  const vectors = cached.length === expected ? cached : vectorsForScope(db, scopeCte, [sessionId]);
+  return aggregateEconomicsVectors(withBilledInputWindow(vectors));
+}
+
+/** Session panels retain their billed-input Window total while using the same
+ * block-level activity weights as archive analytics. Allocate each run's input
+ * volume over the content that actually contributed to its context. */
+function withBilledInputWindow(vectors: SessionEconomicsVector[]): SessionEconomicsVector[] {
+  return vectors.map((vector) => {
+    const totalWeight = ACTIVITY_BUCKETS.reduce((sum, bucket) => {
+      const part = vector.buckets[bucket];
+      return sum + part.generation + part.context_window;
+    }, 0);
+    const buckets = {} as SessionEconomicsVector["buckets"];
+    for (const bucket of ACTIVITY_BUCKETS) {
+      const part = vector.buckets[bucket];
+      const weight = part.generation + part.context_window;
+      const allocatedInput =
+        totalWeight > 0
+          ? vector.billed_input_tokens * (weight / totalWeight)
+          : bucket === "context"
+            ? vector.billed_input_tokens
+            : 0;
+      const orientationWeight = part.generation_orientation + part.context_window_orientation;
+      const orientationShare =
+        weight > 0 ? orientationWeight / weight : bucket === "context" ? 1 : 0;
+      buckets[bucket] = {
+        ...part,
+        context_window: part.context_window + allocatedInput,
+        context_window_orientation:
+          part.context_window_orientation + allocatedInput * orientationShare,
+        touched: part.touched || allocatedInput > 0,
+      };
+    }
+    return { ...vector, buckets };
+  });
+}
+
+/** Persist the complete per-session vector while its normalized rows are hot
+ * in the ingest transaction. Descendant rollups stay dynamic: parent reads
+ * aggregate the independently cached vectors for the current subtree. */
+export function materializeSessionEconomics(db: Database, sessionId: number): boolean {
+  const vectors = vectorsForScope(
+    db,
+    "WITH scoped_session AS (SELECT id FROM session WHERE id = ?1)",
+    [sessionId],
+  );
+  const vector = vectors[0];
+  if (vector == null) {
+    return false;
+  }
+  storeEconomicsVector(db, vector);
+  return true;
+}
+
+interface CostRefresh {
+  id: number;
+  total: number;
+  totalChanged: boolean;
+  staleVector: SessionEconomicsVector | null;
+}
+
+/** Sessions whose stored cost or cached activity cost differs from current
+ * rates. Check the components too: a rate change can leave the total unchanged. */
+function pendingCostRefreshes(db: Database): CostRefresh[] {
+  const pricing = defaultPricing();
+  const rows = queryRows<
+    SessionRow & {
+      estimated_cost_usd: number;
+      format_version: number | null;
+      vector_json: string | null;
+    }
+  >(
+    db,
+    `SELECT s.id, s.model, s.estimated_cost_usd,
+             s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens,
+             s.total_cache_creation_tokens, s.total_cache_creation_1h_tokens,
+             s.total_reasoning_tokens, e.format_version, e.vector_json
+           FROM session s LEFT JOIN session_economics e ON e.session_id = s.id`,
+  );
+  const usage = modelUsageForScope(db, "WITH scoped_session AS (SELECT id FROM session)", []);
+  const pending: CostRefresh[] = [];
+  for (const row of rows) {
+    const parts = sessionCostParts(usage.get(row.id), sessionFallback(row), pricing);
+    const inputCost = parts.input + parts.cacheRead + parts.cacheCreation;
+    const total = totalCost(parts);
+    const vector =
+      row.format_version === SESSION_ECONOMICS_FORMAT_VERSION && row.vector_json != null
+        ? parseEconomicsVector(row.vector_json)
+        : null;
+    const staleVector =
+      vector != null &&
+      vector.id === row.id &&
+      (vector.input_cost !== inputCost ||
+        vector.output_cost !== parts.output ||
+        vector.reported_cost !== parts.reported)
+        ? {
+            ...vector,
+            input_cost: inputCost,
+            output_cost: parts.output,
+            reported_cost: parts.reported,
+          }
+        : null;
+    const totalChanged = row.estimated_cost_usd !== total;
+    if (totalChanged || staleVector != null) {
+      pending.push({ id: row.id, total, totalChanged, staleVector });
+    }
+  }
+  return pending;
+}
+
+/** Reprice stored usage without rereading transcripts or replacing user state.
+ * The write lock is taken only when something changed, and the check reruns
+ * under it so a concurrent writer cannot make it stale. */
+export function refreshSessionCosts(db: Database): number {
+  if (pendingCostRefreshes(db).length === 0) {
+    return 0;
+  }
+  return withImmediateTransaction(db, () => {
+    const pending = pendingCostRefreshes(db);
+    for (const refresh of pending) {
+      if (refresh.totalChanged) {
+        runStatement(db, "UPDATE session SET estimated_cost_usd = ?1 WHERE id = ?2", [
+          refresh.total,
+          refresh.id,
+        ]);
+      }
+      if (refresh.staleVector != null) {
+        storeEconomicsVector(db, refresh.staleVector);
+      }
+    }
+    return pending.length;
+  });
+}
+
+/** One-time upgrade/backfill path. Normal ingest writes vectors immediately;
+ * sync also calls this so unchanged pre-v10 sessions become cached after upgrading. */
+export function materializeMissingSessionEconomics(db: Database): number {
+  const rows = queryRows<{
+    id: number;
+    format_version: number | null;
+    vector_json: string | null;
+  }>(
+    db,
+    `SELECT s.id, e.format_version, e.vector_json
+       FROM session s
+       LEFT JOIN session_economics e ON e.session_id = s.id
+      ORDER BY s.id`,
+  );
+  const staleIds = rows.flatMap((row) => {
+    if (row.format_version !== SESSION_ECONOMICS_FORMAT_VERSION || row.vector_json == null) {
+      return [row.id];
+    }
+    const vector = parseEconomicsVector(row.vector_json);
+    return vector == null || vector.id !== row.id ? [row.id] : [];
+  });
+  if (staleIds.length === 0) {
+    return 0;
+  }
+
+  withImmediateTransaction(db, () => {
+    for (let offset = 0; offset < staleIds.length; offset += 250) {
+      const sessionIds = staleIds.slice(offset, offset + 250);
+      const placeholders = sessionIds.map((_, index) => `?${index + 1}`).join(", ");
+      const vectors = vectorsForScope(
+        db,
+        `WITH scoped_session AS (
+           SELECT id FROM session WHERE id IN (${placeholders})
+         )`,
+        sessionIds,
+      );
+      for (const vector of vectors) {
+        storeEconomicsVector(db, vector);
+      }
+    }
+  });
+  return staleIds.length;
+}
+
+function vectorsForScopeWithCache(
+  db: Database,
+  scopeCte: string,
+  params: QueryParam[],
+): SessionEconomicsVector[] {
+  const expected = scopeCount(db, scopeCte, params);
+  if (expected === 0) {
+    return [];
+  }
+  const cached = cachedVectorsForScope(db, scopeCte, params);
+  return cached.length === expected ? cached : vectorsForScope(db, scopeCte, params);
+}
+
+function scopeCount(db: Database, scopeCte: string, params: QueryParam[]): number {
+  return (
+    queryRow<{ count: number }>(
+      db,
+      `${scopeCte} SELECT COUNT(*) AS count FROM scoped_session`,
+      params,
+    )?.count ?? 0
+  );
+}
+
+function cachedVectorsForScope(
+  db: Database,
+  scopeCte: string,
+  params: QueryParam[],
+  cancelled?: () => boolean,
+): SessionEconomicsVector[] {
+  throwIfEconomicsCancelled(cancelled);
+  const versionParam = `?${params.length + 1}`;
+  const rows = queryRows<{
+    session_id: number;
+    vector_json: string;
+    started_at: string | null;
+  }>(
+    db,
+    `${scopeCte}
+       SELECT e.session_id, e.vector_json, s.started_at
+       FROM scoped_session fs
+       JOIN session s ON s.id = fs.id
+       JOIN session_economics e ON e.session_id = fs.id
+       WHERE e.format_version = ${versionParam}
+       ORDER BY e.session_id`,
+    [...params, SESSION_ECONOMICS_FORMAT_VERSION],
+  );
+  throwIfEconomicsCancelled(cancelled);
+  const vectors: SessionEconomicsVector[] = [];
+  for (const row of rows) {
+    throwIfEconomicsCancelled(cancelled);
+    const vector = parseEconomicsVector(row.vector_json);
+    if (vector != null && vector.id === row.session_id) {
+      vector.started_at = row.started_at;
+      vectors.push(vector);
+    }
+  }
+  return vectors;
+}
+
+function throwIfEconomicsCancelled(cancelled?: () => boolean): void {
+  if (cancelled?.() === true) {
+    throw new Error("aborted");
+  }
+}
+
+function parseEconomicsVector(raw: string): SessionEconomicsVector | null {
+  try {
+    const vector = JSON.parse(raw) as SessionEconomicsVector;
+    if (
+      typeof vector.id !== "number" ||
+      typeof vector.input_cost !== "number" ||
+      typeof vector.output_cost !== "number" ||
+      typeof vector.reported_cost !== "number" ||
+      typeof vector.billed_input_tokens !== "number" ||
+      typeof vector.waiting_on_user_ms !== "number" ||
+      vector.buckets == null ||
+      typeof vector.buckets !== "object"
+    ) {
+      return null;
+    }
+    for (const bucket of ACTIVITY_BUCKETS) {
+      const part = vector.buckets[bucket];
+      if (
+        part == null ||
+        typeof part.generation !== "number" ||
+        typeof part.context_window !== "number" ||
+        typeof part.tool_calls !== "number" ||
+        typeof part.touched !== "boolean" ||
+        typeof part.generation_orientation !== "number" ||
+        typeof part.context_window_orientation !== "number" ||
+        typeof part.active_ms !== "number" ||
+        typeof part.active_ms_orientation !== "number"
+      ) {
+        return null;
+      }
+    }
+    return vector;
+  } catch {
+    return null;
+  }
+}
+
+function storeEconomicsVector(db: Database, vector: SessionEconomicsVector): void {
+  runStatement(
+    db,
+    `INSERT INTO session_economics(session_id, format_version, vector_json, computed_at)
+     VALUES (?1, ?2, ?3, datetime('now'))
+     ON CONFLICT(session_id) DO UPDATE SET
+       format_version = excluded.format_version,
+       vector_json = excluded.vector_json,
+       computed_at = excluded.computed_at`,
+    [vector.id, SESSION_ECONOMICS_FORMAT_VERSION, JSON.stringify(vector)],
+  );
+}
+
+/** Load ordered block rows for generation and latency allocation. Tool-result
+ * blocks do not duplicate their calling tool metadata, so resolve it through
+ * the ingest-time tool_call linkage. The scope-first join is intentional: it
+ * prevents SQLite from scanning the whole block table for a single session. */
+function blockRowsForScope(db: Database, scopeCte: string, params: QueryParam[]): BlockRow[] {
+  return queryRows<BlockRow>(
+    db,
+    `${scopeCte}
+       SELECT b.session_id, b.message_id, m.seq AS seq, m.role, m.output_tokens,
+              CASE WHEN m.role = 'assistant' AND json_valid(m.raw)
+                   THEN json_extract(m.raw, '$.message.id') END AS response_id,
+              CASE WHEN s.tool = 'opencode' AND m.role = 'assistant' AND json_valid(m.raw)
+                   THEN json_extract(m.raw, '$.reasoning_tokens') END AS reasoning_tokens,
+              b.type,
+              COALESCE(b.tool_name, tc.tool_name) AS tool_name,
+              m.timestamp AS timestamp,
+              CASE WHEN b.type IN ('tool_use', 'tool_result', 'web_search')
+                   THEN COALESCE(b.tool_input, tc.input) END AS tool_input,
+              CASE WHEN b.type = 'tool_result'
+                   THEN COALESCE(length(CAST(b.tool_result AS BLOB)), 0)
+                   -- An agent message's routing metadata outweighs its text,
+                   -- and only the text reaches the model.
+                   WHEN b.type = 'other' AND json_valid(b.text)
+                        AND json_extract(b.text, '$.type') = 'agent_message'
+                   THEN (SELECT COALESCE(SUM(length(CAST(json_extract(c.value, '$.text') AS BLOB))), 0)
+                         FROM json_each(b.text, '$.content') c)
+                   ELSE COALESCE(length(CAST(b.text AS BLOB)), 0)
+              END AS text_bytes,
+              CASE WHEN b.type = 'other' AND json_valid(b.text)
+                   THEN json_extract(b.text, '$.type') END AS other_kind
+       FROM scoped_session fs
+       CROSS JOIN block b INDEXED BY idx_block_session
+       JOIN message m ON m.id = b.message_id
+       JOIN session s ON s.id = b.session_id
+       LEFT JOIN tool_call tc ON tc.result_block_id = b.id
+       WHERE b.session_id = fs.id
+       ORDER BY b.session_id, m.seq, b.ordinal`,
+    params,
+  );
+}
+
+function vectorsForScope(
+  db: Database,
+  scopeCte: string,
+  params: QueryParam[],
+): SessionEconomicsVector[] {
+  const sessions = queryRows<SessionRow>(
+    db,
+    `${scopeCte}
+       SELECT s.id, s.tool, s.started_at, s.model, s.total_input_tokens, s.total_output_tokens,
+              s.total_cache_read_tokens, s.total_cache_creation_tokens,
+              s.total_cache_creation_1h_tokens,
+              s.total_reasoning_tokens, s.est_reasoning_tokens
+       FROM session s
+       JOIN scoped_session fs ON fs.id = s.id`,
+    params,
+  );
+  if (sessions.length === 0) {
+    return [];
+  }
+
+  const vectorBySession = new Map<
+    number,
+    { session: SessionRow; buckets: PerSessionBuckets; latency: MutableLatency }
+  >();
+  for (const session of sessions) {
+    vectorBySession.set(session.id, {
+      session,
+      buckets: emptyBuckets(),
+      latency: emptyLatency(),
+    });
+  }
+
+  // Ship byte lengths, not text: bucket math only needs sizes, plus the tool
+  // input for the block types whose bucket depends on the command being run.
+  // Ordering (session, seq, ordinal) lets us place each block before/after the
+  // session's first file edit.
+  const blocks = blockRowsForScope(db, scopeCte, params).filter(
+    (block) => blockActivity(block) !== "skip",
+  );
+  const boundaries = firstEditSeqBySession(blocks);
+  const blocksBySession = groupBy(blocks, (block) => block.session_id);
+  for (const [sessionId, sessionBlocks] of blocksBySession) {
+    const vector = vectorBySession.get(sessionId);
+    if (vector != null) {
+      allocateGeneration([vector.session], sessionBlocks, vector.buckets, boundaries);
+      allocateLatency(vector.session, sessionBlocks, vector.buckets, boundaries, vector.latency);
+      allocateAgentMessages(sessionId, sessionBlocks, vector.buckets, boundaries);
+    }
+  }
+  for (const vector of vectorBySession.values()) {
+    if (!blocksBySession.has(vector.session.id)) {
+      allocateGeneration([vector.session], [], vector.buckets, boundaries);
+    }
+  }
+
+  const results = queryRows<ResultRow>(
+    db,
+    `${scopeCte}
+       SELECT t.session_id, t.tool_name, t.input,
+              COALESCE(t.output_bytes, length(CAST(rb.tool_result AS BLOB)), 0) AS bytes,
+              cm.seq AS call_seq
+       FROM scoped_session fs
+       CROSS JOIN tool_call t INDEXED BY idx_toolcall_session
+       LEFT JOIN block rb ON rb.id = t.result_block_id
+       LEFT JOIN block cb ON cb.id = t.call_block_id
+       LEFT JOIN message cm ON cm.id = cb.message_id
+       WHERE t.session_id = fs.id`,
+    params,
+  );
+  for (const row of results) {
+    const vector = vectorBySession.get(row.session_id);
+    const entry = vector?.buckets.get(toolBucket(row.tool_name, row.input));
+    if (entry == null) {
+      continue;
+    }
+    const tokens = row.bytes / CHARS_PER_TOKEN;
+    entry.contextWindow += tokens;
+    entry.toolCalls += 1;
+    entry.sessions.add(row.session_id);
+    // A tool result belongs to orientation if its call happened before the
+    // session's first edit. Unplaceable calls (no call block) default to
+    // implementation so orientation is never overstated.
+    if (phaseOf(boundaries, row.session_id, row.call_seq) === "orientation") {
+      entry.windowOrientation += tokens;
+    }
+  }
+
+  const usage = modelUsageForScope(db, scopeCte, params);
+  return sessions.map((session) => {
+    const mutable = vectorBySession.get(session.id);
+    const parts = sessionCostParts(usage.get(session.id), sessionFallback(session));
+    const buckets = {} as SessionEconomicsVector["buckets"];
+    for (const bucket of ACTIVITY_BUCKETS) {
+      const entry = mutable?.buckets.get(bucket);
+      buckets[bucket] = {
+        generation: entry?.generation ?? 0,
+        context_window: entry?.contextWindow ?? 0,
+        tool_calls: entry?.toolCalls ?? 0,
+        touched: (entry?.sessions.size ?? 0) > 0 || (entry?.activeMs ?? 0) > 0,
+        generation_orientation: entry?.genOrientation ?? 0,
+        context_window_orientation: entry?.windowOrientation ?? 0,
+        active_ms: entry?.activeMs ?? 0,
+        active_ms_orientation: entry?.activeMsOrientation ?? 0,
+      };
+    }
+    return {
+      id: session.id,
+      started_at: session.started_at,
+      input_cost: parts.input + parts.cacheRead + parts.cacheCreation,
+      output_cost: parts.output,
+      reported_cost: parts.reported,
+      billed_input_tokens:
+        session.total_input_tokens +
+        session.total_cache_read_tokens +
+        session.total_cache_creation_tokens,
+      waiting_on_user_ms: mutable?.latency.waitingOnUserMs ?? 0,
+      buckets,
+    };
+  });
+}
+
+/** Totals and label used to price a session that has no per-model rows yet. */
+function sessionFallback(session: SessionRow): { model: string | null; usage: TokenUsage } {
+  return {
+    model: session.model,
+    usage: {
+      input: session.total_input_tokens,
+      output: session.total_output_tokens,
+      cacheRead: session.total_cache_read_tokens,
+      cacheCreation: session.total_cache_creation_tokens,
+      cacheCreation1h: session.total_cache_creation_1h_tokens,
+      reasoning: session.total_reasoning_tokens,
+    },
+  };
+}
